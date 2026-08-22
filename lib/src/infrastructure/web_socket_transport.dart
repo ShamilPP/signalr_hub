@@ -193,7 +193,7 @@ class WebSocketTransport implements ITransport {
     final socket = _webSocket;
     if (socket != null) {
       _logger.finest(
-        "(WebSockets transport) sending data. ${getDataDetail(data, true)}.",
+        "(WebSockets transport) sending data. ${getDataDetail(data, _logMessageContent && data is String)}.",
       );
 
       if (data is String) {
