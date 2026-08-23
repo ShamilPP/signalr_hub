@@ -29,5 +29,14 @@ jobs:
       - name: Run tests
         run: flutter test
 
+      - name: Diagnose working tree state
+        run: |
+          echo "--- git status ---"
+          git status --porcelain
+          echo "--- diff of tracked changes ---"
+          git diff --
+          echo "--- flutter version ---"
+          flutter --version
+
       - name: Validate package for publishing
         run: flutter pub publish --dry-run
