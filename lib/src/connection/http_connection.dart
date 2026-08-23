@@ -297,19 +297,18 @@ class HttpConnection implements IConnection {
       final response = await _httpClient.post(negotiateUrl, options: options);
 
       if (response.statusCode != 200) {
-        return Future.error(SignalRException(
+        throw SignalRException(
           message:
               "Unexpected status code returned from negotiate ${response.statusCode}",
           type: SignalRExceptionType.http,
           statusCode: response.statusCode,
-        ));
+        );
       }
 
       if (response.content is! String) {
-        return Future.error(
-          SignalRException(
-              message: "Negotation response content must be a json.",
-              type: SignalRExceptionType.invalidPayload),
+        throw SignalRException(
+          message: "Negotation response content must be a json.",
+          type: SignalRExceptionType.invalidPayload,
         );
       }
 
