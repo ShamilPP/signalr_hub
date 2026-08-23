@@ -1,4 +1,4 @@
-testapp/
+samples/
 build/
 coverage/
 .dart_tool/

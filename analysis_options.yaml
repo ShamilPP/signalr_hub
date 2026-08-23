@@ -17,7 +17,7 @@ analyzer:
     unused_element: warning
     dead_code: warning
   exclude:
-    - "testapp/**"
+    - "samples/**"
     - build/**
     - android/**
     - ios/**

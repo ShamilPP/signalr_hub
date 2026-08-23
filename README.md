@@ -12,7 +12,7 @@ The client is able to invoke server side hub functions (including streaming func
 The client supports the following transport protocols:
 
 - WebSocket
-- Service Side Events
+- Server-Sent Events
 - Long Polling
 
 The client supports the following hub protocols:
@@ -22,8 +22,11 @@ The client supports the following hub protocols:
 
 ## Examples
 
-- [Chat client/server](https://github.com/ShamilPP/SignalR_HUB/tree/main/example) - A simple client/server chat application.
-- [Integration test app](https://github.com/ShamilPP/SignalR_HUB/tree/main/testapp/client) - To see how a client calls various types of hub functions.
+Both samples in this repository include the ASP.NET Core hub they connect to, so each one runs end to end.
+
+**[Real-time chat](https://github.com/ShamilPP/SignalR_HUB/tree/main/example)** — a chat application pairing a Flutter client with a minimal ASP.NET Core hub. It covers the everyday path: building and starting a connection, sending messages to the hub, and handling messages the server pushes back.
+
+**[Hub invocation reference](https://github.com/ShamilPP/SignalR_HUB/tree/main/samples/client)** — every hub-invocation shape, exercised in isolation: methods with no parameters, with simple parameters, and with complex parameters; each with and without a return value; invocations in both directions, client-to-server and server-to-client; and streaming requests. Useful when you need to see exactly how one specific call pattern is wired.
 
 ## Getting Started
 
