@@ -128,13 +128,14 @@ String httpContentSummary(Object? content) {
 }
 
 String formatArrayBuffer(Uint8List data) {
-  var str = "";
+  final sb = StringBuffer();
   for (final val in data) {
-    final pad = val < 16 ? "0" : "";
-    str += "0x$pad${val.toString()} ";
+    if (sb.isNotEmpty) sb.write(' ');
+    sb.write('0x');
+    if (val < 16) sb.write('0');
+    sb.write(val);
   }
-  if (str.isEmpty) return "";
-  return str.substring(0, str.length - 1);
+  return sb.toString();
 }
 
 Future<void> sendMessage(
