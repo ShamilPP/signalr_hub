@@ -296,6 +296,18 @@ class HttpConnection implements IConnection {
       );
       final response = await _httpClient.post(negotiateUrl, options: options);
 
+      if (response.statusCode == 401 || response.statusCode == 403) {
+        // Called out separately so callers can refresh a token and retry
+        // rather than treating this as a generic negotiation failure.
+        throw SignalRAuthException(
+          message:
+              "Negotiation was rejected with status ${response.statusCode}. "
+              "The access token is missing, expired, or lacks the claims the "
+              "hub requires.",
+          statusCode: response.statusCode,
+        );
+      }
+
       if (response.statusCode != 200) {
         throw SignalRException(
           message:

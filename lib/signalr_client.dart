@@ -1,6 +1,7 @@
 library;
 
 export 'src/core/abort_controller.dart';
+export 'src/core/cancellation_token.dart';
 export 'src/core/signalr_exception.dart';
 export 'src/core/iconnection.dart';
 export 'src/core/iretry_policy.dart';
@@ -12,6 +13,7 @@ export 'src/connection/negotiate_models.dart';
 export 'src/hub/hub_connection.dart';
 export 'src/hub/hub_connection_builder.dart';
 export 'src/hub/hub_connection_state.dart';
+export 'src/hub/hub_lifecycle_manager.dart';
 export 'src/infrastructure/web_supporting_http_client.dart';
 export 'src/protocol/binary_message_format.dart';
 export 'src/protocol/handshake_protocol.dart';

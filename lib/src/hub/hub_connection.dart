@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:logging/logging.dart';
 
+import '../core/cancellation_token.dart';
 import '../core/signalr_exception.dart';
 import '../core/iconnection.dart';
 import '../core/iretry_policy.dart';
@@ -56,6 +57,10 @@ class HubConnection {
   Timer? _timeoutTimer;
   Timer? _pingServerTimer;
 
+  /// When data was last received from the server, used by [probeConnection]
+  /// to tell a live connection from a silently dead one.
+  DateTime? _lastMessageReceived;
+
   /// The server timeout in milliseconds.
   ///
   /// If this timeout elapses without receiving any messages from the server, the connection will be terminated with an error.
@@ -69,6 +74,18 @@ class HubConnection {
   /// Allows the server to detect hard disconnects (like when a client unplugs their computer).
   ///
   late int keepAliveIntervalInMilliseconds;
+
+  /// How long [invoke] waits for the server's completion message.
+  ///
+  /// Defaults to [Duration.zero], which waits indefinitely — the behaviour of
+  /// earlier versions. Set a duration to make every `invoke` fail with a
+  /// [SignalRTimeoutException] instead of hanging when a server stops
+  /// responding, or pass `timeout:` to a single `invoke` call.
+  ///
+  /// ```dart
+  /// hub.invocationTimeout = const Duration(seconds: 30);
+  /// ```
+  Duration invocationTimeout = Duration.zero;
 
   /// Indicates the state of the {@link HubConnection} to the server.
   HubConnectionState? get state => _connectionState;
@@ -300,6 +317,18 @@ class HubConnection {
   /// args: The arguments used to invoke the server method.
   /// Returns an object that yields results from the server as they are received.
   ///
+  /// A stream does not survive a reconnect. The server keeps no record of it
+  /// across connections, so when the transport drops the stream ends with a
+  /// [SignalRTransportException] and must be requested again once the
+  /// connection is back. Resubscribing automatically would risk replaying
+  /// side effects the server already performed, so it is left to the caller:
+  ///
+  /// ```dart
+  /// hub.onreconnected(({connectionId}) {
+  ///   subscription = hub.stream('Ticker', []).listen(onTick);
+  /// });
+  /// ```
+  ///
   Stream<Object?> stream(String methodName, List<Object?> args) {
     return streamControllable(methodName, args).stream;
   }
@@ -371,6 +400,63 @@ class HubConnection {
     return _sendMessage(_protocol.writeMessage(message as HubMessageBase));
   }
 
+  /// Checks whether the server is still reachable over the current connection.
+  ///
+  /// Sends a ping and waits up to [timeout] for any message from the server.
+  /// Returns `true` if the connection is alive, `false` if the send failed or
+  /// nothing came back in time.
+  ///
+  /// This exists because a suspended mobile app often resumes holding a socket
+  /// that looks open but is no longer carrying traffic. Waiting for
+  /// [serverTimeoutInMilliseconds] to notice takes 30 seconds by default; this
+  /// answers in about two.
+  ///
+  /// A `false` result does not change the connection state — the caller
+  /// decides what to do. [HubLifecycleManager] uses this on app resume and
+  /// restarts the connection when the probe fails.
+  Future<bool> probeConnection({
+    Duration timeout = const Duration(seconds: 2),
+  }) async {
+    if (_connectionState != HubConnectionState.connected) {
+      return false;
+    }
+
+    final probeStarted = DateTime.now();
+
+    try {
+      await _sendMessage(_cachedPingMessage);
+    } catch (e) {
+      // A send that throws means the transport is already broken, which is
+      // the clearest possible answer.
+      _logger.finer("Connection probe could not send a ping: $e");
+      return false;
+    }
+
+    // Any inbound traffic proves the connection is alive — the server's own
+    // keep-alive pings count, so this works on an otherwise idle hub.
+    const pollInterval = Duration(milliseconds: 100);
+    final deadline = probeStarted.add(timeout);
+
+    while (DateTime.now().isBefore(deadline)) {
+      final lastReceived = _lastMessageReceived;
+      if (lastReceived != null && lastReceived.isAfter(probeStarted)) {
+        return true;
+      }
+      if (_connectionState != HubConnectionState.connected) {
+        return false;
+      }
+      await Future<void>.delayed(pollInterval);
+    }
+
+    final lastReceived = _lastMessageReceived;
+    final alive = lastReceived != null && lastReceived.isAfter(probeStarted);
+    if (!alive) {
+      _logger.info(
+          "Connection probe received no response within ${timeout.inMilliseconds} ms.");
+    }
+    return alive;
+  }
+
   /// Invokes a hub method on the server using the specified name and arguments. Does not wait for a response from the receiver.
   ///
   /// The Promise returned by this method resolves when the client has sent the invocation to the server. The server may still
@@ -398,36 +484,87 @@ class HubConnection {
   ///
   /// methodName: The name of the server method to invoke.
   /// args: The arguments used to invoke the server method.
+  /// timeout: How long to wait for the server's completion message. Defaults
+  /// to [invocationTimeout]. Pass [Duration.zero] to wait indefinitely.
+  /// cancellationToken: Abandons the invocation when canceled.
   /// Returns a Future that resolves with the result of the server method (if any), or rejects with an error.
   ///
-  Future<Object?> invoke(String methodName, {List<Object?>? args}) {
+  /// Throws [SignalRTimeoutException] if the server does not answer within the
+  /// timeout, and [SignalRCancelledException] if [cancellationToken] is
+  /// canceled. In both cases a `CancelInvocation` message is sent so the
+  /// server can stop working on the call.
+  ///
+  Future<Object?> invoke(
+    String methodName, {
+    List<Object?>? args,
+    Duration? timeout,
+    CancellationToken? cancellationToken,
+  }) {
     args = args ?? <Object?>[];
     final t = _replaceStreamingParams(args);
     final invocationDescriptor =
         _createInvocation(methodName, args, false, t.keys.toList());
+    final invocationId = invocationDescriptor.invocationId;
 
     final completer = Completer<Object?>();
 
-    _callbacks[invocationDescriptor.invocationId] =
+    Timer? timeoutTimer;
+    void Function()? removeCancelListener;
+
+    // Runs on every exit path so a finished invocation leaves nothing behind
+    // in _callbacks, and neither the timer nor the token listener outlives it.
+    void cleanup() {
+      timeoutTimer?.cancel();
+      timeoutTimer = null;
+      removeCancelListener?.call();
+      removeCancelListener = null;
+      _callbacks.remove(invocationId);
+    }
+
+    // Abandons a call the caller is no longer waiting for. The server is told
+    // to stop via CancelInvocation; failing to send that is not worth
+    // surfacing, since the caller already has its error.
+    void abandon(SignalRException error) {
+      if (completer.isCompleted) {
+        return;
+      }
+      cleanup();
+      completer.completeError(error);
+      unawaited(
+        _sendWithProtocol(_createCancelInvocation(invocationId))
+            .catchError((Object e) {
+          _logger
+              .finer("Could not send CancelInvocation for '$methodName': $e");
+        }),
+      );
+    }
+
+    _callbacks[invocationId] =
         (HubMessageBase? invocationEvent, Object? error) {
       if (error != null) {
-        if (!completer.isCompleted) completer.completeError(error);
+        if (!completer.isCompleted) {
+          cleanup();
+          completer.completeError(error);
+        }
         return;
       } else if (invocationEvent != null) {
         if (invocationEvent is CompletionMessage) {
           if (invocationEvent.error != null) {
             if (!completer.isCompleted) {
+              cleanup();
               completer.completeError(SignalRException(
                   message: invocationEvent.error ?? 'Unknown error',
                   type: SignalRExceptionType.signalr));
             }
           } else {
             if (!completer.isCompleted) {
+              cleanup();
               completer.complete(invocationEvent.result);
             }
           }
         } else {
           if (!completer.isCompleted) {
+            cleanup();
             completer.completeError(SignalRException(
                 message: "Unexpected message type: ${invocationEvent.type}",
                 type: SignalRExceptionType.signalr));
@@ -436,11 +573,32 @@ class HubConnection {
       }
     };
 
+    if (cancellationToken != null) {
+      removeCancelListener = cancellationToken.addListener(() {
+        abandon(SignalRCancelledException(
+            message:
+                "Invocation of '$methodName' was canceled by the caller."));
+      });
+    }
+
+    // A zero duration means "wait indefinitely", matching the documented
+    // behaviour of invocationTimeout.
+    final effectiveTimeout = timeout ?? invocationTimeout;
+    if (effectiveTimeout > Duration.zero && !completer.isCompleted) {
+      timeoutTimer = Timer(effectiveTimeout, () {
+        abandon(SignalRTimeoutException(
+            message: "Invocation of '$methodName' timed out after "
+                "${effectiveTimeout.inMilliseconds} ms without a response "
+                "from the server."));
+      });
+    }
+
     final promiseQueue =
-        _sendWithProtocol(invocationDescriptor).catchError((e) {
-      if (!completer.isCompleted) completer.completeError(e);
-      // invocationId will always have a value for a non-blocking invocation
-      _callbacks.remove(invocationDescriptor.invocationId);
+        _sendWithProtocol(invocationDescriptor).catchError((Object e) {
+      if (!completer.isCompleted) {
+        cleanup();
+        completer.completeError(e);
+      }
     });
 
     _launchStreams(t, promiseQueue);
@@ -529,6 +687,7 @@ class HubConnection {
 
   void _processIncomingData(Object? data) {
     _cleanupTimeout();
+    _lastMessageReceived = DateTime.now();
 
     if (!_receivedHandshakeResponse) {
       data = _processHandshakeResponse(data);
@@ -602,15 +761,14 @@ class HubConnection {
     } catch (e) {
       final message = "Error parsing handshake response: '${e.toString()}'.";
       _logger.severe(message);
-      return _failHandshake(SignalRException(
-          message: message, type: SignalRExceptionType.signalr));
+      return _failHandshake(
+          SignalRHandshakeException(message: message, original: e));
     }
     if (!isStringEmpty(handshakeResult.handshakeResponseMessage.error)) {
       final message =
           "Server returned handshake error: '${handshakeResult.handshakeResponseMessage.error}'";
       _logger.severe(message);
-      return _failHandshake(SignalRException(
-          message: message, type: SignalRExceptionType.signalr));
+      return _failHandshake(SignalRHandshakeException(message: message));
     } else {
       _logger.finer("Server handshake complete.");
     }
@@ -665,10 +823,9 @@ class HubConnection {
 
   void _serverTimeout(Timer t) {
     final stopFuture = _connection.stop(
-      error: SignalRException(
+      error: SignalRTimeoutException(
         message:
             "Server timeout elapsed without receiving a message from the server.",
-        type: SignalRExceptionType.timeout,
       ),
     );
     if (stopFuture != null) {
@@ -770,11 +927,14 @@ class HubConnection {
       handshake.complete();
     }
 
+    // Pending invocations and streams cannot survive a transport change: the
+    // server keeps no record of them across connections. Fail them with a
+    // transport error so callers can tell a dropped connection apart from a
+    // server-side error and resubscribe once reconnected.
     _cancelCallbacksWithError(error ??
-        SignalRException(
+        SignalRTransportException(
             message:
-                "Invocation canceled due to the underlying connection being closed.",
-            type: SignalRExceptionType.signalr));
+                "Invocation canceled due to the underlying connection being closed."));
 
     _cancelStreamSubscriptions();
     _cancelAllTimers();

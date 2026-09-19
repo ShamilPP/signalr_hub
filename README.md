@@ -265,6 +265,126 @@ I/flutter ( 5248): HTTP send: url 'https://localhost:5000/negotiate?negotiateVer
 headers: '{ content-type: text/plain;charset=UTF-8 }, { HEADER_MOCK_1: HEADER_VALUE_1 }, { X-Requested-With: FlutterHttpClient }, { HEADER_MOCK_2: HEADER_VALUE_2 }, { Authorization: Bearer JWT_TOKEN }'
 ```
 
+## Mobile app lifecycle
+
+When a mobile app is backgrounded, the OS or the carrier usually tears down the TCP connection without telling the client. The socket still looks open while silently dropping every frame, so a resumed app appears connected but nothing works — and nothing surfaces until the 30-second server timeout expires.
+
+`HubLifecycleManager` handles this. On resume it pings the server and waits about two seconds for any reply. If nothing comes back, it stops the stale connection and restarts it immediately instead of waiting out the timeout.
+
+```dart
+final hub = HubConnectionBuilder().withUrl(serverUrl).build();
+final lifecycle = HubLifecycleManager(hub)..attach();
+
+await hub.start();
+
+// When the connection is no longer needed:
+lifecycle.detach();
+await hub.stop();
+```
+
+`detach()` must be called, otherwise the observer stays registered for the life of the app. In a `StatefulWidget`, attach in `initState` and detach in `dispose`.
+
+To release the server's resources while backgrounded instead, at the cost of a full reconnect on resume:
+
+```dart
+final lifecycle = HubLifecycleManager(hub, disconnectOnPause: true)..attach();
+```
+
+You can also probe the connection yourself. This changes no state; it just reports whether the server is reachable:
+
+```dart
+if (await hub.probeConnection()) {
+  await hub.invoke('SendMessage', args: [message]);
+}
+```
+
+## Invocation timeouts and cancellation
+
+By default `invoke()` waits indefinitely for the server's reply. If the server stops responding, the `Future` never completes. Set a timeout to fail instead of hanging:
+
+```dart
+// Applies to every invoke on this connection.
+hub.invocationTimeout = const Duration(seconds: 30);
+
+// Or per call.
+final result = await hub.invoke(
+  'GetReport',
+  args: [reportId],
+  timeout: const Duration(seconds: 10),
+);
+```
+
+On expiry the call throws `SignalRTimeoutException`, and a `CancelInvocation` message is sent so the server stops working on it.
+
+The default remains `Duration.zero` (wait indefinitely) so upgrading changes nothing until you opt in.
+
+To abandon a request whose result is no longer needed — a screen the user has left, for example — pass a `CancellationToken`:
+
+```dart
+class _ReportPageState extends State<ReportPage> {
+  final _token = CancellationToken();
+
+  @override
+  void initState() {
+    super.initState();
+    hub.invoke('GetReport', cancellationToken: _token).then(_show);
+  }
+
+  @override
+  void dispose() {
+    _token.cancel(); // tells the server to stop too
+    super.dispose();
+  }
+}
+```
+
+The call then throws `SignalRCancelledException`. A token is single-use — create one per invocation.
+
+## Error handling
+
+All exceptions extend `SignalRException`, so existing `catch` blocks keep working. The subclasses let you tell failures apart:
+
+| Exception | Means |
+| --- | --- |
+| `SignalRHandshakeException` | The server rejected the protocol handshake — usually a protocol mismatch, such as MessagePack not registered server-side. |
+| `SignalRAuthException` | Negotiation was rejected with HTTP 401 or 403. Check the token from `accessTokenFactory`; `statusCode` carries the status. |
+| `SignalRTimeoutException` | An invocation or the server timeout elapsed. |
+| `SignalRTransportException` | The underlying socket failed, or dropped while calls were pending. |
+| `SignalRCancelledException` | A `CancellationToken` was canceled. |
+
+```dart
+try {
+  await hub.invoke('GetReport', timeout: const Duration(seconds: 10));
+} on SignalRAuthException {
+  await refreshTokenAndRestart();
+} on SignalRTimeoutException {
+  showRetryBanner();
+} on SignalRTransportException {
+  // The connection dropped; the retry policy is already reconnecting.
+}
+```
+
+### Streams and reconnects
+
+A stream does not survive a reconnect: the server keeps no record of it across connections. When the transport drops, the stream ends with a `SignalRTransportException` and must be requested again. This is not done automatically, because replaying a stream could repeat side effects the server already performed.
+
+```dart
+StreamSubscription<Object?>? subscription;
+
+void subscribe() {
+  subscription = hub.stream('Ticker', []).listen(
+    onTick,
+    onError: (e) {
+      // SignalRTransportException means the connection dropped;
+      // onreconnected below will resubscribe.
+    },
+  );
+}
+
+hub.onreconnected(({connectionId}) => subscribe());
+subscribe();
+```
+
 ## Server Configuration (CORS & Proxies)
 
 If you are using a proxy (like NGINX or Apache) or your Flutter web client connects from a different domain, you must enable CORS and configure proxy settings on your ASP.NET Core backend.
