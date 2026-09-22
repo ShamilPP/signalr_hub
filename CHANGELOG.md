@@ -1,3 +1,11 @@
+## [2.2.1]
+
+* **Widened the `equatable` constraint to `>=2.0.8 <4.0.0`** so the package resolves against `equatable` 3.0.0, released 2026-09-15. The previous `^2.0.8` excluded it, which would have cost a pub.dev "supported dependencies" point once 3.0.0 turned 30 days old, and forced a downgrade on anyone whose app already used 3.x.
+
+  `equatable` 3.0.0 drops `EquatableMixin`, stops comparing `runtimeType`, and removes the custom `toString`. None of these reach this package: `HttpConnectionOptions` and `AvailableTransport` both use plain `extends Equatable` with a `props` override, neither is subclassed, and neither relies on `stringify`. Equality and `hashCode` behave identically on both versions, and the test suite passes against `equatable` 2.0.8 and 3.0.0 alike.
+
+* **Added `test/equatable_compat_test.dart`** covering equality, inequality, `hashCode`, and `copyWith` for both classes, so a future `equatable` release cannot quietly change the semantics of these public types.
+
 ## [2.2.0]
 
 Adds app lifecycle handling, invocation timeouts, and a typed exception hierarchy. All changes are backwards compatible: existing code compiles and behaves as before, and the new behaviour is opt-in.
